@@ -2,23 +2,18 @@
 #include <mcp_can.h>
 #include <ESP32Servo.h>
 #include "cybergear_controller.hh"
-
 // 関数の前方宣言
 void init_can();
 float hexToFloat(String hexValue);
 int hexToInt(String hexValue);
 void escArm();
 void updateSpeed();
-void setServoPosition(uint8_t channel, int degrees);
-void triggerServo(uint8_t channel);
+void rotateBLMoter(int pwmValue);
 
 int RX_PIN = 16; // 受信機の信号ピン(受信機の TX に接続)
 int TX_PIN = 17; // 受信機の信号ピン(受信機の RX に接続)
-
-
 #define CAN_INT 32 // MCP2515 CAN モジュールのINTピンを32番ピンに接続
 MCP_CAN CAN(27); // MCP2515 CAN モジュールのCSピンを27番ピンに接続
-
 // CyberGear モーターを設定する
 uint8_t MASTER_CAN_ID = 0x00;
 uint8_t FL_CAN_ID = 0x7F; // モーターの CAN ID
@@ -27,24 +22,23 @@ uint8_t FR_CAN_ID = 0x7D; // モーターの CAN ID
 uint8_t BR_CAN_ID = 0x7C; // モーターの CAN ID
 std::vector<uint8_t> motor_ids = {FL_CAN_ID, BL_CAN_ID, FR_CAN_ID, BR_CAN_ID};
 std::vector<float> motor_speeds = {0.0f, 0.0f, 0.0f, 0.0f};
-
 // CyberGear コントローラを設定する
 CybergearController controller = CybergearController(MASTER_CAN_ID);
 // 輪のベース径と半径を設定する
 float wheel_base = 0.31f;
 float wheel_radius = 0.05f;
-
 // サーボモータの設定
 int SERVO_PIN_R = 5;  // サーボモータの信号ピン
 int SERVO_PIN_L = 14;  // サーボモータの信号ピン
-// Servo servo_r;  // サーボモータのインスタンスを作成
-// Servo servo_l;  // サーボモータのインスタンスを作成
+Servo servo_r;  // サーボモータのインスタンスを作成
+Servo servo_l;  // サーボモータのインスタンスを作成
 int shoot_r = 0;  // サーボモータの初期位置(ゼロ度合わせ必要あり)
 int shoot_l = 0;  // サーボモータの初期位置(ゼロ度合わせ必要あり)
-
+int shoot_r_pose = 0;
+int shoot_l_pose = 0;
+int minUs = 500;
+int maxUs = 2400;
 // 射出モータ設定
-// Servo esc_l;
-// Servo esc_r;
 const int injection_motor_r_pwm_pin = 21; // 射出モータpwm : injection_motor_pwm
 const int injection_motor_l_pwm_pin = 22; // 射出モータpwm : injection_motor_pwm
 // ESCのPWM信号の範囲（マイクロ秒単位）
@@ -54,7 +48,8 @@ const int pwmMax = 2000;  // 最大速度（2ms）
 const int speedLevels = 5;
 int speedIndex = 0; // 初期速度（停止）
 
-
+bool motorState = false;       // モーターの状態（ON/OFF）
+bool lastTriangleState = false; // 前回のボタン状態
 
 void setup()
 {
@@ -62,7 +57,9 @@ void setup()
   Serial.begin(115200);
   // 受信機のシリアル通信を開始する
   Serial1.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN);
-
+  // サーボモータの設定
+  servo_r.attach(SERVO_PIN_R, minUs, maxUs);
+  servo_l.attach(SERVO_PIN_L, minUs, maxUs);
   // CyberGear モーターの初期化
   init_can();
   Serial.println("Initializing CyberGear driver ...");
@@ -72,34 +69,27 @@ void setup()
   controller.set_speed_limit(motor_ids[2], 2.0f); // モーターの速度制限を設定する
   controller.set_speed_limit(motor_ids[3], 2.0f); // モーターの速度制限を設定する
   controller.enable_motors(); // モーターへの電力供給を開始する
-
   // 射出モータの初期化
   pinMode(injection_motor_r_pwm_pin, OUTPUT);
   pinMode(injection_motor_l_pwm_pin, OUTPUT);
-  ledcSetup(0, 50, 8); // PWMチャンネル0, 周波数50Hz (20ms周期), 16bit解像度
-  ledcSetup(1, 50, 8); // PWMチャンネル1, 周波数50Hz (20ms周期), 16bit解像度
-  ledcAttachPin(injection_motor_r_pwm_pin, 0);
-  ledcAttachPin(injection_motor_l_pwm_pin, 1);
-
+  ledcSetup(8, 50, 16); // PWMチャンネル0, 周波数50Hz (20ms周期), 16bit解像度
+  ledcSetup(9, 50, 16); // PWMチャンネル1, 周波数50Hz (20ms周期), 16bit解像度
+  ledcAttachPin(injection_motor_r_pwm_pin, 8);
+  ledcAttachPin(injection_motor_l_pwm_pin, 9);
   // ESCのアーム手順を実行
   escArm();
   // 初期速度を表示
   updateSpeed();
 
-  // サーボモータの設定
-  // servo_r.attach(SERVO_PIN_R);
-  // servo_l.attach(SERVO_PIN_L);
-  pinMode(SERVO_PIN_R, OUTPUT);
-  pinMode(SERVO_PIN_L, OUTPUT);
-  ledcSetup(8, 50, 16); // PWMチャンネル2, 周波数50Hz (20ms周期), 16bit解像度
-  ledcSetup(9, 50, 16); // PWMチャンネル3, 周波数50Hz (20ms周期), 16bit解像度
-  ledcAttachPin(SERVO_PIN_R, 8);
-  ledcAttachPin(SERVO_PIN_L, 9);
-  ledcWrite(8, pwmMin);
-  ledcWrite(9, pwmMin);
+  //pinMode(SERVO_PIN_R, OUTPUT);
+  //pinMode(SERVO_PIN_L, OUTPUT);
+  //ledcSetup(8, 50, 16); // PWMチャンネル2, 周波数50Hz (20ms周期), 16bit解像度
+  //ledcSetup(9, 50, 16); // PWMチャンネル3, 周波数50Hz (20ms周期), 16bit解像度
+  //ledcAttachPin(SERVO_PIN_R, 8);
+  //ledcAttachPin(SERVO_PIN_L, 9);
+  //ledcWrite(8, pwmMin);
+  //ledcWrite(9, pwmMin);
 }
-
-
 void loop()
 {
   // 受信機からデータを読み取れる場合
@@ -119,10 +109,8 @@ void loop()
         int shoot_r = hexToInt(message.substring(12, 14));
         int shoot_l = hexToInt(message.substring(15, 17));
         int triangle = hexToInt(message.substring(18, 20));
-        
         // デバッグ用
         Serial.println(String(linear_x) + "," + String(linear_y) + "," + String(angular_z) + "," + String(shoot_r) + "," + String(shoot_l) + "," + String(triangle));
-        
         // CyberGear モーターの速度を算出する（メカナムホイール用）
         float fl_speed = (linear_x - linear_y - angular_z * wheel_base) / wheel_radius;
         float fr_speed = -(linear_x + linear_y + angular_z * wheel_base) / wheel_radius; // モータの設置位置によって正負が異なる
@@ -130,58 +118,67 @@ void loop()
         float br_speed = -(linear_x - linear_y + angular_z * wheel_base) / wheel_radius; // モータの設置位置によって正負が異なる
         motor_speeds = {fl_speed, bl_speed, fr_speed, br_speed};
         
+        Serial.println(shoot_r);
+        
+        // R1 ボタンが押された時の処理
         if (shoot_r == 1)
         {
           Serial.println("Right side shoot");
-          triggerServo(8);
-
-          // servo_r.write(90);
-          // servo_r.write(180);
-          // delay(100);
-          // servo_r.write(0);
-          // delay(100);
+          servo_r.write(45);
+        }
+        else
+        {
+          servo_r.write(0);
         }
 
+        // L1 ボタンが押された時の処理
         if (shoot_l == 1)
         {
           Serial.println("left side shoot");
-          triggerServo(9);
-
-          // Serial.println("left side shoot");
-          // servo_l.write(90);
-          // delay(100);
-          // servo_l.write(180);
-          // delay(100);
-          // servo_l.write(0);
-          // delay(100);
+          servo_l.write(135);
+        }
+        else
+        {
+          servo_l.write(180);
         }
 
+        // 三角ボタンが押された時の処理
         if (triangle == 1)
         {
-          Serial.println("射出モータ on ");
-          // 速度アップ
-          if (speedIndex < speedLevels - 1) {
-            speedIndex++;
-            updateSpeed();
+          int pwm_value = 1000;
+          // ボタンが押されたとき（前回は押されていなかった）
+          if (!lastTriangleState) 
+          {
+            // 状態を反転
+            motorState = !motorState;
+            
+            if (motorState) {
+              // ONに切り替わった場合
+              Serial.println("射出モータ ON");
+              // 速度を設定（望ましい速度レベルに）
+              speedIndex = 3; // 例: 中速に設定
+              pwm_value = 1250;
+
+            } else {
+              // OFFに切り替わった場合
+              Serial.println("射出モータ OFF");
+              // 速度を0に設定
+              pwm_value = 1000;
+            }
+          rotateBLMoter(pwm_value);
           }
-          // if (speedIndex > 0) {
-          //   speedIndex--;
-          //   updateSpeed();
-          // }
         }
       }
     }
     // 受信機からデータを読み込めない場合
-    else 
+    else
     {
       motor_speeds = {0.0, 0.0, 0.0, 0.0};
     }
     // CyberGear モーターにコマンドを転送する
     controller.send_speed_command(motor_ids, motor_speeds);
   }
-  
   // Serial.println("serial1 is not abailable.");
-
   // モーターのデータを更新・取得する
   std::vector<MotorStatus> status_list;
   if ( controller.process_can_packet() ) {
@@ -200,8 +197,6 @@ void loop()
     }
   }
 }
-
-
 void init_can()
 {
   Serial.println("Initializing CAN communication ...");
@@ -209,7 +204,6 @@ void init_can()
   CAN.setMode(MCP_NORMAL);
   pinMode(CAN_INT, INPUT);
 }
-
 float hexToFloat(String hexValue) {
   // 16 進数から整数に変換する
   int intValue = (int)strtol(hexValue.c_str(), NULL, 16);
@@ -217,7 +211,6 @@ float hexToFloat(String hexValue) {
   float floatValue = map(intValue, 0, 20, -10, 10) / 10.0;
   return floatValue;
 }
-
 int hexToInt(String hexValue) {
   // 16 進数から整数に変換する
   int intValue = (int)strtol(hexValue.c_str(), NULL, 16);
@@ -225,64 +218,29 @@ int hexToInt(String hexValue) {
 }
 
 // 速度を更新する関数
-// void updateSpeed() {
-//   int pwmValue = map(speedIndex, 0, speedLevels - 1, pwmMin, pwmMax);
-//   esc_r.writeMicroseconds(pwmValue * 65536L / 20000);
-//   esc_l.writeMicroseconds(pwmValue * 65536L / 20000);
-  
-//   Serial.print("Speed Level: ");
-//   Serial.print(speedIndex);
-//   Serial.print(" PWM: ");
-//   Serial.println(pwmValue);
-// }
-
-// ESCをアームする関数（最小PWMを送信してESCを起動）
-// void escArm() {
-//   Serial.println("Arming ESC...");
-//   esc_r.writeMicroseconds(pwmMin * 65536L / 20000);
-//   esc_l.writeMicroseconds(pwmMin * 65536L / 20000);
-//   delay(2000); // ESCのアームが完了するまで待機
-//   Serial.println("ESC Armed");
-// }
-
-// 速度を更新する関数
 void updateSpeed() {
     int pwmValue = map(speedIndex, 0, speedLevels - 1, pwmMin, pwmMax);
-    ledcWrite(0, pwmValue * 65536L / 20000); // マイクロ秒をPWM値に変換
-    ledcWrite(1, pwmValue * 65536L / 20000); // マイクロ秒をPWM値に変換
-    
+    ledcWrite(8, pwmValue * 65536L / 20000); // マイクロ秒をPWM値に変換
+    ledcWrite(9, pwmValue * 65536L / 20000); // マイクロ秒をPWM値に変換
+
     Serial.print("Speed Level: ");
     Serial.print(speedIndex);
     Serial.print(" PWM: ");
     Serial.println(pwmValue);
 }
 
+void rotateBLMoter(int pwmValue)
+{
+  ledcWrite(8, pwmValue * 65536L / 20000); // マイクロ秒をPWM値に変換
+  ledcWrite(9, pwmValue * 65536L / 20000); // マイクロ秒をPWM値に変換
+  Serial.print(" PWM: ");
+  Serial.println(pwmValue);
+}
 // ESCをアームする関数（最小PWMを送信してESCを起動）
 void escArm() {
     Serial.println("Arming ESC...");
-    ledcWrite(0, pwmMin * 65536L / 20000);
-    ledcWrite(1, pwmMin * 65536L / 20000);
+    ledcWrite(8, pwmMin * 65536L / 20000);
+    ledcWrite(9, pwmMin * 65536L / 20000);
     delay(3000); // ESCのアームが完了するまで待機
     Serial.println("ESC Armed");
-}
-// サーボ制御関数
-void setServoPosition(uint8_t channel, int degrees) {
-  // サーボの角度を0-180度から、1000-2000μsのパルス幅に変換
-  // 16bit解像度（0-65535）での値に変換
-  uint32_t pulseWidth = map(degrees, 0, 180, 1000, 2000);
-  uint32_t duty = (pulseWidth * 65536) / 20000; // 20000μs = 50Hz周期
-  ledcWrite(channel, duty);
-}
-
-void triggerServo(uint8_t channel) {
-  // サーボを90度に移動
-  setServoPosition(channel, 90);
-  delay(300);
-  
-  // サーボを180度に移動
-  setServoPosition(channel, 180);
-  delay(300);
-  
-  // サーボを0度に戻す
-  setServoPosition(channel, 0);
 }
